@@ -100,13 +100,15 @@ private:
     const std::shared_ptr<rclcpp_action::ServerGoalHandle<nao_led_interfaces::action::LedsPlay>>
     goal_handle,
     std::array<uint8_t, 2> & leds, float frequency,
-    std::array<std_msgs::msg::ColorRGBA, 8> & colors);
+    std::array<std_msgs::msg::ColorRGBA, 8> & colors,
+    float duration);
 
   bool loopMode(
     const std::shared_ptr<rclcpp_action::ServerGoalHandle<nao_led_interfaces::action::LedsPlay>>
     goal_handle,
     std::array<uint8_t, 2> & leds, float frequency,
-    std::array<std_msgs::msg::ColorRGBA, 8> & colors);
+    std::array<std_msgs::msg::ColorRGBA, 8> & colors,
+    float duration);
 };
 
 }  // namespace nao_led_action_server

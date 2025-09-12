@@ -85,6 +85,7 @@ rclcpp_action::GoalResponse LedsPlayActionServer::handleGoal(
 {
   RCLCPP_INFO(this->get_logger(), "Received LED goal request");
   (void)uuid;
+  // (void)goal;
 
   // TODO checks on goal integrity
 
@@ -131,7 +132,7 @@ void LedsPlayActionServer::execute(
   if (mode == nao_led_interfaces::msg::LedModes::STEADY) {
     steadyMode(goal_handle, leds, frequency, colors, intensities);
   } else if (mode == nao_led_interfaces::msg::LedModes::BLINKING) {
-    canceled = blinkingMode(goal_handle, leds, frequency, colors);
+    canceled = blinkingMode(goal_handle, leds, frequency, colors, duration);
     if (canceled) {
       result->success = true;
       goal_handle->canceled(result);
@@ -140,7 +141,7 @@ void LedsPlayActionServer::execute(
     }
     //
   } else if (mode == nao_led_interfaces::msg::LedModes::LOOP) {
-    canceled = loopMode(goal_handle, leds, frequency, colors);
+    canceled = loopMode(goal_handle, leds, frequency, colors, duration);
     if (canceled) {
       result->success = true;
       goal_handle->canceled(result);
@@ -162,7 +163,11 @@ void LedsPlayActionServer::steadyMode(
   std::array<uint8_t, 2> & leds, float frequency, std::array<std_msgs::msg::ColorRGBA, 8> & colors,
   std::array<float, 12> & intensities)
 {
+  // (void)goal_handle;
+  // (void)frequency;
   auto result = std::make_shared<nao_led_interfaces::action::LedsPlay::Result>();
+
+  RCLCPP_INFO(this->get_logger(), "Steady mode started");
 
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::HEAD) {
     nao_lola_command_msgs::msg::HeadLeds head_leds_msg;
@@ -214,10 +219,16 @@ void LedsPlayActionServer::steadyMode(
 bool LedsPlayActionServer::blinkingMode(
   const std::shared_ptr<rclcpp_action::ServerGoalHandle<nao_led_interfaces::action::LedsPlay>>
     goal_handle,
-  std::array<uint8_t, 2> & leds, float frequency, std::array<std_msgs::msg::ColorRGBA, 8> & colors)
+  std::array<uint8_t, 2> & leds, float frequency, std::array<std_msgs::msg::ColorRGBA, 8> & colors,
+  float duration)
 {
   rclcpp::Rate loop_rate(frequency);
   bool canceled = false;
+
+  rclcpp::Time start_time = this->now();
+
+  RCLCPP_INFO(this->get_logger(), "Blinking mode started. Duration: %f seconds. Frequency: %f Hz start time: %.2f",
+              duration, frequency, this->now().seconds());
 
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::HEAD) {
     nao_lola_command_msgs::msg::HeadLeds head_leds_on;
@@ -231,6 +242,8 @@ bool LedsPlayActionServer::blinkingMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if (((this->now() - start_time).seconds() >= duration) && duration != -1) break;
       c = (c + 1) % 2;
 
       if (c == 0) {
@@ -240,6 +253,8 @@ bool LedsPlayActionServer::blinkingMode(
       }
       loop_rate.sleep();
     }
+
+    head_pub_->publish(head_leds_off);
   }
 
   if (
@@ -262,6 +277,8 @@ bool LedsPlayActionServer::blinkingMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if (((this->now() - start_time).seconds() >= duration) && duration != -1) break;
       c = (c + 1) % 2;
 
       if (c == 0) {
@@ -273,6 +290,9 @@ bool LedsPlayActionServer::blinkingMode(
       }
       loop_rate.sleep();
     }
+    
+    right_eye_pub_->publish(right_eye_leds_off);
+    left_eye_pub_->publish(left_eye_leds_off);
   }
 
   if (
@@ -295,6 +315,8 @@ bool LedsPlayActionServer::blinkingMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if (((this->now() - start_time).seconds() >= duration) && duration != -1) break;
       c = (c + 1) % 2;
 
       if (c == 0) {
@@ -306,6 +328,9 @@ bool LedsPlayActionServer::blinkingMode(
       }
       loop_rate.sleep();
     }
+
+    right_ear_pub_->publish(right_ear_leds_off);
+    left_ear_pub_->publish(left_ear_leds_off);
   }
 
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::CHEST) {
@@ -318,6 +343,8 @@ bool LedsPlayActionServer::blinkingMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
       c = (c + 1) % 2;
 
       if (c == 0) {
@@ -327,6 +354,8 @@ bool LedsPlayActionServer::blinkingMode(
       }
       loop_rate.sleep();
     }
+
+    chest_pub_->publish(chest_led_off);
   }
   RCLCPP_ERROR(this->get_logger(), "LED blinking mode not executed");
   return canceled = false;
@@ -335,20 +364,32 @@ bool LedsPlayActionServer::blinkingMode(
 bool LedsPlayActionServer::loopMode(
   const std::shared_ptr<rclcpp_action::ServerGoalHandle<nao_led_interfaces::action::LedsPlay>>
     goal_handle,
-  std::array<uint8_t, 2> & leds, float frequency, std::array<std_msgs::msg::ColorRGBA, 8> & colors)
+  std::array<uint8_t, 2> & leds, float frequency, std::array<std_msgs::msg::ColorRGBA, 8> & colors,
+  float duration)
 {
   rclcpp::Rate loop_rate(frequency);
   bool canceled = false;
 
+  rclcpp::Time start_time = this->now();
+
+  RCLCPP_INFO(this->get_logger(), "Loop mode started. Duration: %f seconds. Frequency: %f Hz start time: %.2f",
+              duration, frequency, this->now().seconds());
+
   // HEAD
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::HEAD) {
     nao_lola_command_msgs::msg::HeadLeds head_leds_msg;
+    nao_lola_command_msgs::msg::HeadLeds head_leds_off;
+    for (unsigned i = 0; i < nao_lola_command_msgs::msg::HeadLeds::NUM_LEDS; ++i) {
+      head_leds_off.intensities[i] = 0.0;
+    }
 
     uint8_t c = 0;
     while (rclcpp::ok()) {
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
       c = (c + 1) % nao_lola_command_msgs::msg::HeadLeds::NUM_LEDS;
 
       for (unsigned i = 0; i < nao_lola_command_msgs::msg::HeadLeds::NUM_LEDS; ++i) {
@@ -360,6 +401,8 @@ bool LedsPlayActionServer::loopMode(
 
       loop_rate.sleep();
     }
+
+    head_pub_->publish(head_leds_off);
   }
 
   // EYES
@@ -368,8 +411,14 @@ bool LedsPlayActionServer::loopMode(
      leds[1] == nao_led_interfaces::msg::LedIndexes::LEYE) ||
     (leds[0] == nao_led_interfaces::msg::LedIndexes::LEYE &&
      leds[1] == nao_led_interfaces::msg::LedIndexes::REYE)) {
-    nao_lola_command_msgs::msg::RightEyeLeds right_eye_leds_msg;
-    nao_lola_command_msgs::msg::LeftEyeLeds left_eye_leds_msg;
+    nao_lola_command_msgs::msg::RightEyeLeds right_eye_leds_msg, right_eye_leds_off;
+    nao_lola_command_msgs::msg::LeftEyeLeds left_eye_leds_msg, left_eye_leds_off;
+
+    for (unsigned i = 0; i < nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS; ++i) {
+      right_eye_leds_off.colors[i] = color_off_;
+      left_eye_leds_off.colors[i] = color_off_;
+    }
+
     short int cw = 0, cw_succ = 0;
     short int ccw = 0, ccw_succ = 0;
     const short int num_eye_leds = nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS;
@@ -377,6 +426,8 @@ bool LedsPlayActionServer::loopMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
 
       for (unsigned i = 0; i < num_eye_leds; ++i) {
         right_eye_leds_msg.colors[i] = colors[i];
@@ -398,6 +449,9 @@ bool LedsPlayActionServer::loopMode(
 
       loop_rate.sleep();
     }
+
+    right_eye_pub_->publish(right_eye_leds_off);
+    left_eye_pub_->publish(left_eye_leds_off);
   }
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::REYE) {
     nao_lola_command_msgs::msg::RightEyeLeds right_eye_leds_msg;
@@ -406,6 +460,9 @@ bool LedsPlayActionServer::loopMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
+
       c = (c + 1) % nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS;
 
       for (unsigned i = 0; i < nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS; ++i) {
@@ -416,6 +473,8 @@ bool LedsPlayActionServer::loopMode(
 
       loop_rate.sleep();
     }
+
+    right_eye_pub_->publish(right_eye_leds_msg);
   }
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::LEYE) {
     nao_lola_command_msgs::msg::LeftEyeLeds left_eye_leds_msg;
@@ -424,6 +483,9 @@ bool LedsPlayActionServer::loopMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
+
       c = (c + 1) % nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS;
 
       for (unsigned i = 0; i < nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS; ++i) {
@@ -434,6 +496,8 @@ bool LedsPlayActionServer::loopMode(
 
       loop_rate.sleep();
     }
+
+    left_eye_pub_->publish(left_eye_leds_msg);
   }
 
   // EARS
@@ -442,14 +506,22 @@ bool LedsPlayActionServer::loopMode(
      leds[1] == nao_led_interfaces::msg::LedIndexes::LEAR) ||
     (leds[0] == nao_led_interfaces::msg::LedIndexes::LEAR &&
      leds[1] == nao_led_interfaces::msg::LedIndexes::REAR)) {
-    nao_lola_command_msgs::msg::RightEarLeds right_ear_leds_msg;
-    nao_lola_command_msgs::msg::LeftEarLeds left_ear_leds_msg;
+    nao_lola_command_msgs::msg::RightEarLeds right_ear_leds_msg, right_ear_leds_off;
+    nao_lola_command_msgs::msg::LeftEarLeds left_ear_leds_msg, left_ear_leds_off;
+
+    for (unsigned i = 0; i < nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS; ++i) {
+      right_ear_leds_off.intensities[i] = 0.0;
+      left_ear_leds_off.intensities[i] = 0.0;
+    }
 
     uint8_t c = 0;
     while (rclcpp::ok()) {
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
+
       c = (c + 1) % nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS;
       for (unsigned i = 0; i < nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS; ++i) {
         right_ear_leds_msg.intensities[i] = 1.0;
@@ -462,6 +534,9 @@ bool LedsPlayActionServer::loopMode(
 
       loop_rate.sleep();
     }
+
+    right_ear_pub_->publish(right_ear_leds_off);
+    left_ear_pub_->publish(left_ear_leds_off);
   }
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::REAR) {
     nao_lola_command_msgs::msg::RightEarLeds right_ear_leds_msg;
@@ -471,6 +546,9 @@ bool LedsPlayActionServer::loopMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
+
       c = (c + 1) % nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS;
       for (unsigned i = 0; i < nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS; ++i) {
         right_ear_leds_msg.intensities[i] = 1.0;
@@ -480,6 +558,8 @@ bool LedsPlayActionServer::loopMode(
 
       loop_rate.sleep();
     }
+
+    right_ear_pub_->publish(right_ear_leds_msg);
   }
   if (leds[0] == nao_led_interfaces::msg::LedIndexes::LEAR) {
     nao_lola_command_msgs::msg::LeftEarLeds left_ear_leds_msg;
@@ -489,6 +569,9 @@ bool LedsPlayActionServer::loopMode(
       if (goal_handle->is_canceling()) {
         return canceled = true;
       }
+      RCLCPP_DEBUG(this->get_logger(), "Elapsed time: %f seconds", (this->now() - start_time).seconds());
+      if ((this->now() - start_time).seconds() >= duration && duration != -1) break;
+      
       c = (c + 1) % nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS;
       for (unsigned i = 0; i < nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS; ++i) {
         left_ear_leds_msg.intensities[i] = 1.0;
@@ -498,6 +581,8 @@ bool LedsPlayActionServer::loopMode(
 
       loop_rate.sleep();
     }
+
+    left_ear_pub_->publish(left_ear_leds_msg);
   }
 
   RCLCPP_ERROR(this->get_logger(), "LED loop mode not executed");
