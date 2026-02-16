@@ -179,12 +179,12 @@ void LedsPlayActionServer::handleAccepted(const std::shared_ptr<GoalHandleLedsPl
 
 bool LedsPlayActionServer::shouldStop(const std::shared_ptr<GoalHandleLedsPlay> & goal_handle) const
 {
-  """
-  Check if the current execution should stop, either due to:
-  - ROS shutdown
-  - Internal stop request (e.g. preemption)
-  - Goal cancelation
-  """
+  
+  /// Check if the current execution should stop, either due to:
+  ///- ROS shutdown
+  ///- Internal stop request (e.g. preemption)
+  ///- Goal cancelation
+
   if (!rclcpp::ok()) {
     return true;
   }
