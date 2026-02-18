@@ -13,8 +13,6 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/LedsPlay.action"
-  "action/Emotion.action"
-  "srv/SetEmotion.srv"
   "msg/LedIndexes.msg"
   "msg/LedModes.msg"
   DEPENDENCIES std_msgs geometry_msgs
