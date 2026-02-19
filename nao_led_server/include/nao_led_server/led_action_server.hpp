@@ -17,9 +17,11 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include "nao_led_interfaces/action/leds_play.hpp"
 #include "nao_led_interfaces/msg/led_indexes.hpp"
@@ -67,13 +69,13 @@ private:
   // Common
   std_msgs::msg::ColorRGBA color_off_;
 
-  // Threading / preemption
-  std::atomic_bool stop_requested_{false};
-  std::mutex worker_mutex_;
-  std::thread worker_;
+  // ---- NEW: per-effector preemption via generations (no interface changes) ----
+  static constexpr std::size_t kNumEffectors = 8;  // must match LedIndexes::NUMLEDS
+  std::array<std::atomic<std::uint64_t>, kNumEffectors> eff_gen_{};
 
-  std::mutex goal_mutex_;
-  std::weak_ptr<GoalHandleLedsPlay> active_goal_;
+  // Store per-goal tokens (captured generations for the effectors included in that goal)
+  std::mutex goal_tokens_mtx_;
+  std::unordered_map<GoalHandleLedsPlay *, std::array<std::uint64_t, kNumEffectors>> goal_tokens_;
 
   // Action callbacks
   rclcpp_action::GoalResponse handleGoal(
@@ -112,6 +114,10 @@ private:
     float frequency_hz,
     const std::array<std_msgs::msg::ColorRGBA, 8> & colors,
     float duration_s);
+
+  // Keep same naming style; internal helper (no ROS interface impact)
+  std::array<std_msgs::msg::ColorRGBA, 8>
+  normalize_eye_colors(const std::array<std_msgs::msg::ColorRGBA, 8> & in);
 };
 
 }  // namespace nao_led_action_server
