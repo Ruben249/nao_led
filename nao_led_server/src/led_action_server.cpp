@@ -14,8 +14,10 @@
 
 #include "nao_led_server/led_action_server.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <thread>
 
 #include "rclcpp_components/register_node_macro.hpp"
 
@@ -23,6 +25,52 @@ namespace nao_led_action_server
 {
 
 using namespace std::chrono_literals;
+
+// -----------------------------------------------------------------------------
+// Small robustness helpers (do NOT change external behaviour)
+// -----------------------------------------------------------------------------
+
+namespace
+{
+// If the client floods goals, spawning an unbounded number of detached threads can
+// exhaust resources. This cap keeps the server alive under stress.
+// It does NOT affect normal usage; preempted goals exit quickly.
+constexpr int kMaxActiveGoalThreads = 64;
+
+std::atomic<int> g_active_goal_threads{0};
+
+static inline float clamp_frequency(float hz)
+{
+  // Avoid pathological values that can cause rate/sleep issues.
+  if (hz < 0.1F) {
+    return 0.1F;
+  }
+  if (hz > 100.0F) {
+    return 100.0F;
+  }
+  return hz;
+}
+
+static inline bool safe_goal_is_active(
+  const std::shared_ptr<LedsPlayActionServer::GoalHandleLedsPlay> & gh)
+{
+  try {
+    return gh && gh->is_active();
+  } catch (...) {
+    return false;
+  }
+}
+
+static inline bool safe_goal_is_canceling(
+  const std::shared_ptr<LedsPlayActionServer::GoalHandleLedsPlay> & gh)
+{
+  try {
+    return gh && gh->is_canceling();
+  } catch (...) {
+    return false;
+  }
+}
+}  // namespace
 
 static inline bool is_valid_eff(uint8_t eff)
 {
@@ -114,8 +162,6 @@ LedsPlayActionServer::LedsPlayActionServer(const rclcpp::NodeOptions & options)
 
 LedsPlayActionServer::~LedsPlayActionServer()
 {
-  // Nothing special: each goal runs in a detached thread and will exit naturally.
-  // We only need to clear token map (best-effort).
   std::lock_guard<std::mutex> lk(goal_tokens_mtx_);
   goal_tokens_.clear();
 }
@@ -140,6 +186,31 @@ rclcpp_action::CancelResponse LedsPlayActionServer::handleCancel(
 
 void LedsPlayActionServer::handleAccepted(const std::shared_ptr<GoalHandleLedsPlay> goal_handle)
 {
+  // Stress guard: avoid unbounded detached thread creation.
+  // Keeps behaviour identical in normal conditions.
+  const int prev = g_active_goal_threads.fetch_add(1, std::memory_order_acq_rel);
+  if (prev + 1 > kMaxActiveGoalThreads) {
+    g_active_goal_threads.fetch_sub(1, std::memory_order_acq_rel);
+
+    auto result = std::make_shared<LedsPlay::Result>();
+    result->success = false;
+
+    // Best-effort: immediately abort (goal may already be transitioning).
+    if (safe_goal_is_active(goal_handle)) {
+      try {
+        goal_handle->abort(result);
+      } catch (const rclcpp::exceptions::RCLError & e) {
+        RCLCPP_WARN(get_logger(), "Failed to abort (flood guard) (RCLError): %s", e.what());
+      }
+    }
+
+    RCLCPP_WARN(
+      get_logger(),
+      "Too many concurrent LED goals (%d). Flood guard aborted goal.",
+      prev + 1);
+    return;
+  }
+
   // Per-effector preemption: bump generation only for effectors referenced by this goal.
   const auto goal = goal_handle->get_goal();
   const auto leds = goal->leds;
@@ -162,7 +233,7 @@ void LedsPlayActionServer::handleAccepted(const std::shared_ptr<GoalHandleLedsPl
     goal_tokens_[goal_handle.get()] = tokens;
   }
 
-  // Keep the same "structure": detach an execution thread for this goal.
+  // Keep the same structure: detached execution thread for this goal.
   std::thread([this, goal_handle]() { execute(goal_handle); }).detach();
 }
 
@@ -179,6 +250,23 @@ bool LedsPlayActionServer::shouldStop(const std::shared_ptr<GoalHandleLedsPlay> 
 
 void LedsPlayActionServer::execute(const std::shared_ptr<GoalHandleLedsPlay> goal_handle)
 {
+  // Ensure we always decrement active thread count and erase tokens.
+  struct CleanupGuard
+  {
+    LedsPlayActionServer * self;
+    std::shared_ptr<GoalHandleLedsPlay> gh;
+    explicit CleanupGuard(LedsPlayActionServer * s, std::shared_ptr<GoalHandleLedsPlay> g)
+    : self(s), gh(std::move(g)) {}
+    ~CleanupGuard()
+    {
+      if (self) {
+        std::lock_guard<std::mutex> lk(self->goal_tokens_mtx_);
+        self->goal_tokens_.erase(gh.get());
+      }
+      g_active_goal_threads.fetch_sub(1, std::memory_order_acq_rel);
+    }
+  } guard(this, goal_handle);
+
   RCLCPP_INFO(get_logger(), "Executing LED goal");
 
   const auto goal = goal_handle->get_goal();
@@ -229,20 +317,17 @@ void LedsPlayActionServer::execute(const std::shared_ptr<GoalHandleLedsPlay> goa
 
   if (!any_requested()) {
     result->success = false;
-    if (goal_handle->is_active()) {
+    if (safe_goal_is_active(goal_handle)) {
       try {
         goal_handle->abort(result);
       } catch (const rclcpp::exceptions::RCLError & e) {
         RCLCPP_WARN(get_logger(), "Failed to abort goal (RCLError): %s", e.what());
       }
     }
-    // cleanup token map
-    std::lock_guard<std::mutex> lk(goal_tokens_mtx_);
-    goal_tokens_.erase(goal_handle.get());
     return;
   }
 
-  // Execute mode. Each mode now internally stops publishing for an effector if it's preempted.
+  // Execute mode. Each mode internally stops publishing for an effector if it's preempted.
   if (mode == LedModes::STEADY) {
     stopped_early = steadyMode(goal_handle, leds, colors, intensities, duration);
   } else if (mode == LedModes::BLINKING) {
@@ -252,55 +337,65 @@ void LedsPlayActionServer::execute(const std::shared_ptr<GoalHandleLedsPlay> goa
   } else {
     publishOff(leds);
     result->success = false;
-    if (goal_handle->is_active()) {
+    if (safe_goal_is_active(goal_handle)) {
       try {
         goal_handle->abort(result);
       } catch (const rclcpp::exceptions::RCLError & e) {
         RCLCPP_WARN(get_logger(), "Failed to abort goal (RCLError): %s", e.what());
       }
     }
-    std::lock_guard<std::mutex> lk(goal_tokens_mtx_);
-    goal_tokens_.erase(goal_handle.get());
     return;
   }
 
-  // Goal finalization (ONLY from this thread).
+  // Goal finalization (ONLY from this thread). Guard against invalid state transitions.
   if (stopped_early) {
-    if (goal_handle->is_canceling()) {
+    if (safe_goal_is_canceling(goal_handle)) {
       result->success = true;
+      // In rclcpp action server, canceled() should be called when canceling.
       try {
         goal_handle->canceled(result);
       } catch (const rclcpp::exceptions::RCLError & e) {
         RCLCPP_WARN(get_logger(), "Failed to mark goal canceled (RCLError): %s", e.what());
+      } catch (...) {
+        RCLCPP_WARN(get_logger(), "Failed to mark goal canceled (unknown exception)");
       }
     } else {
       // stopped early due to preemption of all targeted effectors, or ROS shutdown
       result->success = false;
-      if (goal_handle->is_active()) {
+      if (safe_goal_is_active(goal_handle)) {
         try {
           goal_handle->abort(result);
         } catch (const rclcpp::exceptions::RCLError & e) {
           RCLCPP_WARN(get_logger(), "Failed to abort goal (RCLError): %s", e.what());
+        } catch (...) {
+          RCLCPP_WARN(get_logger(), "Failed to abort goal (unknown exception)");
         }
       }
     }
-
-    std::lock_guard<std::mutex> lk(goal_tokens_mtx_);
-    goal_tokens_.erase(goal_handle.get());
     return;
   }
 
   if (rclcpp::ok()) {
     result->success = true;
-    try {
-      goal_handle->succeed(result);
-    } catch (const rclcpp::exceptions::RCLError & e) {
-      RCLCPP_WARN(get_logger(), "Failed to mark goal succeeded (RCLError): %s", e.what());
+    if (safe_goal_is_active(goal_handle)) {
+      try {
+        goal_handle->succeed(result);
+      } catch (const rclcpp::exceptions::RCLError & e) {
+        RCLCPP_WARN(get_logger(), "Failed to mark goal succeeded (RCLError): %s", e.what());
+      } catch (...) {
+        RCLCPP_WARN(get_logger(), "Failed to mark goal succeeded (unknown exception)");
+      }
+    } else if (safe_goal_is_canceling(goal_handle)) {
+      // If it became canceling late, prefer cancel completion over succeed.
+      try {
+        goal_handle->canceled(result);
+      } catch (const rclcpp::exceptions::RCLError & e) {
+        RCLCPP_WARN(get_logger(), "Failed to mark goal canceled (late) (RCLError): %s", e.what());
+      } catch (...) {
+        RCLCPP_WARN(get_logger(), "Failed to mark goal canceled (late) (unknown exception)");
+      }
     }
   }
-
-  std::lock_guard<std::mutex> lk(goal_tokens_mtx_);
-  goal_tokens_.erase(goal_handle.get());
 }
 
 void LedsPlayActionServer::publishOff(const std::array<uint8_t, 2> & leds)
@@ -396,7 +491,6 @@ bool LedsPlayActionServer::steadyMode(
   };
 
   auto publish_off_owned = [&]() {
-    // Only turn off effectors that are still owned by this goal
     if (owned(LedIndexes::HEAD)) {
       nao_lola_command_msgs::msg::HeadLeds msg;
       for (unsigned i = 0; i < nao_lola_command_msgs::msg::HeadLeds::NUM_LEDS; ++i) {
@@ -521,7 +615,6 @@ bool LedsPlayActionServer::steadyMode(
     rclcpp::Rate rate(50.0);
     while (!shouldStop(goal_handle)) {
       if (!any_owned_now()) {
-        // fully preempted
         return true;
       }
       rate.sleep();
@@ -531,8 +624,6 @@ bool LedsPlayActionServer::steadyMode(
   }
 
   if (duration_s == 0.0F) {
-    // keep it one-shot and do not auto-off (matches your prior intent)
-    // but to keep semantics consistent with your newer server, we do off only if still owned
     publish_off_owned();
     return false;
   }
@@ -541,7 +632,7 @@ bool LedsPlayActionServer::steadyMode(
   rclcpp::Rate rate(50.0);
   while (!shouldStop(goal_handle)) {
     if (!any_owned_now()) {
-      return true;  // fully preempted
+      return true;
     }
     if ((now() - start).seconds() >= duration_s) {
       break;
@@ -566,13 +657,13 @@ bool LedsPlayActionServer::blinkingMode(
   float duration_s)
 {
   if (frequency_hz <= 0.0F) {
-    // nothing to do; treat as early stop
     return true;
   }
 
+  frequency_hz = clamp_frequency(frequency_hz);
+
   const auto eye_colors = normalize_eye_colors(colors_in);
 
-  // tokens snapshot for this goal
   std::array<std::uint64_t, kNumEffectors> tokens{};
   tokens.fill(0);
   {
@@ -603,7 +694,6 @@ bool LedsPlayActionServer::blinkingMode(
     return false;
   };
 
-  // publish off only for effectors still owned by this goal
   auto publish_off_owned = [&]() {
     if (owned(LedIndexes::HEAD)) {
       nao_lola_command_msgs::msg::HeadLeds msg;
@@ -663,7 +753,6 @@ bool LedsPlayActionServer::blinkingMode(
 
   while (!shouldStop(goal_handle)) {
     if (!any_owned_now()) {
-      // fully preempted
       return true;
     }
 
@@ -734,7 +823,6 @@ bool LedsPlayActionServer::blinkingMode(
     loop_rate.sleep();
   }
 
-  // turn off only what we still own
   publish_off_owned();
   return shouldStop(goal_handle);
 }
@@ -750,9 +838,10 @@ bool LedsPlayActionServer::loopMode(
     return true;
   }
 
+  frequency_hz = clamp_frequency(frequency_hz);
+
   const auto eye_colors = normalize_eye_colors(colors_in);
 
-  // tokens snapshot for this goal
   std::array<std::uint64_t, kNumEffectors> tokens{};
   tokens.fill(0);
   {
@@ -843,8 +932,8 @@ bool LedsPlayActionServer::loopMode(
   uint8_t ear_c = 0;
   int eye_step = 0;
 
-  const int eye_n  = nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS;
-  const int ear_n  = nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS;
+  const int eye_n = nao_lola_command_msgs::msg::RightEyeLeds::NUM_LEDS;
+  const int ear_n = nao_lola_command_msgs::msg::RightEarLeds::NUM_LEDS;
   const int head_n = nao_lola_command_msgs::msg::HeadLeds::NUM_LEDS;
 
   while (!shouldStop(goal_handle)) {
@@ -866,7 +955,6 @@ bool LedsPlayActionServer::loopMode(
       head_pub_->publish(msg);
     }
 
-    // Eyes: compute once per tick, but publish per-eye only if owned
     const bool do_reye = owned(LedIndexes::REYE);
     const bool do_leye = owned(LedIndexes::LEYE);
     if (do_reye || do_leye) {
